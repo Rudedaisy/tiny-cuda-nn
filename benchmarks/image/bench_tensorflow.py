@@ -34,6 +34,9 @@ import sys
 import tensorflow.compat.v1 as tf
 import tensorflow_probability as tfp
 import time
+import pickle
+
+from tensorflow.python.client import device_lib
 
 SCRIPTS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "scripts")
 sys.path.insert(0, SCRIPTS_DIR)
@@ -154,20 +157,20 @@ def linear_layer(inputs, units, dtype, name, use_biases=True):
 	# inputs: 2d Tensor, shape=(batch, in_units).
 	# units: Integer, dimensionality of the output space.
 
-	assert len(inputs.shape) == 2
-	with tf.variable_scope(name, reuse=tf.AUTO_REUSE) as scope:
-		weights = tf.get_variable("weights", (inputs.shape[1], units),
-									initializer=tf.glorot_uniform_initializer())
+        assert len(inputs.shape) == 2
+        with tf.variable_scope(name, reuse=tf.AUTO_REUSE) as scope:
+                weights = tf.get_variable("weights", (inputs.shape[1], units),
+                                          initializer=tf.glorot_uniform_initializer())
 
-		if use_biases:
-			biases = tf.get_variable("biases", (units),
-											initializer=tf.constant_initializer())
+                if use_biases:
+                        biases = tf.get_variable("biases", (units),
+                                                 initializer=tf.constant_initializer())
 
-	result = tf.matmul(tf.cast(inputs, dtype), tf.cast(weights, dtype))
-	if use_biases:
-		result = result + tf.cast(biases, dtype)
-
-	return tf.cast(result, tf.float32)
+        result = tf.matmul(tf.cast(inputs, dtype), tf.cast(weights, dtype))
+        if use_biases:
+                result = result + tf.cast(biases, dtype)
+                
+        return tf.cast(result, tf.float32), tf.cast(inputs, tf.float32), tf.cast(weights, tf.float32)
 
 def activation(tensor, kind):
 	kind = kind.lower()
@@ -213,142 +216,167 @@ def get_train_op(config, variables, gradients, optimizer, clip_norm=0):
 	return train_op, gradients_norm
 
 def make_graph():
-	uniform = tfp.distributions.Uniform()
-	input_tensor = uniform.sample((batch_size_tensor, target_fun.n_dims))
-	target_tensor = target_fun.eval_tf(input_tensor)
+        uniform = tfp.distributions.Uniform()
+        input_tensor = uniform.sample((batch_size_tensor, target_fun.n_dims))
+        target_tensor = target_fun.eval_tf(input_tensor)
 
-	current_tensor = encoding(input_tensor, False, "encoding")
+        current_tensor = encoding(input_tensor, False, "encoding")
 
-	for i in range(config["network"]["n_hidden_layers"]):
-		current_tensor = linear_layer(current_tensor, config["network"]["n_neurons"], tf.float16, f"fc{i}", False)
-		current_tensor = activation(current_tensor, config["network"]["activation"])
+        ifms = []
+        filts = []
+        
+        for i in range(config["network"]["n_hidden_layers"]):
+                current_tensor, ifm, filt = linear_layer(current_tensor, config["network"]["n_neurons"], tf.float16, f"fc{i}", False)
+                ifms.append(ifm)
+                filts.append(filt)
+                current_tensor = activation(current_tensor, config["network"]["activation"])
 
-	output_tensor = linear_layer(current_tensor, target_fun.n_channels, tf.float16, f"fc_out", False)
-	output_tensor = activation(output_tensor, config["network"]["output_activation"])
+        output_tensor, ifm, filt = linear_layer(current_tensor, target_fun.n_channels, tf.float16, f"fc_out", False)
+        ifms.append(ifm)
+        filts.append(filt)
+        output_tensor = activation(output_tensor, config["network"]["output_activation"])
 
-	relative_l2_error = (target_tensor - output_tensor)**2 / (tf.stop_gradient(output_tensor)**2 + 0.01)
-	loss = tf.math.reduce_mean(relative_l2_error)
-
-	LOSS_SCALE = 128
-	variables = tf.trainable_variables()
-	gradients, _ = compute_gradients(loss, variables, LOSS_SCALE)
-	train_op, _ = get_train_op(config, variables, gradients, optimizer)
-
-	return train_op, loss, input_tensor, output_tensor
+        relative_l2_error = (target_tensor - output_tensor)**2 / (tf.stop_gradient(output_tensor)**2 + 0.01)
+        loss = tf.math.reduce_mean(relative_l2_error)
+        
+        LOSS_SCALE = 128
+        variables = tf.trainable_variables()
+        gradients, _ = compute_gradients(loss, variables, LOSS_SCALE)
+        train_op, _ = get_train_op(config, variables, gradients, optimizer)
+        
+        return train_op, loss, input_tensor, output_tensor, ifms, filts
 
 if __name__ == "__main__":
-	tf.disable_eager_execution()
-	args = get_args()
+        tf.disable_eager_execution()
+        args = get_args()
+        
+        # Initialize non-TF stuff
+        with open(os.path.join(DATA_DIR, args.config)) as config_file:
+                config = json.load(config_file)
+                
+        target_fun = Image(os.path.join(IMAGES_DIR, args.image))
+        encoding = OneBlob(config["encoding"]["n_bins"], 1)
+        
+        # Initialize TF graph
+        batch_size_tensor = tf.placeholder(tf.int32, shape=[])
+        optimizer = tf.train.AdamOptimizer(config["optimizer"]["learning_rate"], config["optimizer"]["beta1"], config["optimizer"]["beta2"], config["optimizer"]["epsilon"])
+        train_op, loss, input_tensor, output_tensor, ifms, filts = make_graph()
+        
+        # Variables for saving/displaying image results
+        resolution = 1024
+        img_shape = (resolution, resolution, target_fun.n_channels)
+        
+        half_dx = 0.5 / resolution
+        xs = np.linspace(half_dx, 1-half_dx, resolution)
+        xv, yv = np.meshgrid(xs, xs)
+        
+        xy = np.stack((xv.flatten(), yv.flatten())).transpose()
+        gt = np.reshape(target_fun(xy), img_shape)
+        write_image("reference.jpg", gt)
+        
+        # Enable XLA compiler (important for good TensorFlow performance)
+        session_config = tf.ConfigProto()
+        session_config.graph_options.optimizer_options.global_jit_level = tf.OptimizerOptions.ON_1
+        
+        timer = time.perf_counter()
+        
+        # Run the network
+        with tf.Session(config=session_config) as sess:
+                PRINT_INTERVAL = 100
+                
+                bench_result = { "tensorflow": [] }
+                
+                for batch_size in [2**14, 2**15, 2**16, 2**17, 2**18, 2**19, 2**20, 2**21]:
+                        N_ITERS = 1000
+                        PRINT_INTERVAL = 100
+                        
+                        output_dummy_variable = tf.Variable(tf.zeros(shape=[batch_size, target_fun.n_channels], dtype=tf.float32), trainable=False)
+                        sess.run(tf.initialize_all_variables())
+                        
+                        # Training
+                        c = lambda it, _, __: tf.less(it, PRINT_INTERVAL)
+                        def body(it, sequencer, _):
+                                with tf.control_dependencies([sequencer]):
+                                        local_train_op, local_loss, _, _, ifms, filts = make_graph()
+                                with tf.control_dependencies([local_train_op]):
+                                        next_sequencer = tf.ones([])
+                                        return it+1, next_sequencer, local_loss
+                                
+                        train_op, _, loss = tf.while_loop(c, body, [0, 1., 0.], parallel_iterations=1)
+                        
+                        throughputs = []
+                        for i in range(0, N_ITERS, PRINT_INTERVAL):
+                                if i % PRINT_INTERVAL == 0:
+                                        if i > 800:
+                                                _, loss_val, all_inputs, all_filts = sess.run([train_op, loss, ifms, filts], feed_dict={ batch_size_tensor: batch_size })
+                                                models = []
+                                                for layer_idx in range(len(all_inputs)):
+                                                        models.append({'in_channels': all_inputs[layer_idx].shape[1],
+                                                                       'out_channels': all_filts[layer_idx].shape[1],
+                                                                       'kernel': (1,1),
+                                                                       'name': "fc"+str(layer_idx),
+                                                                       'padding': (0,0),
+                                                                       'weights': all_filts[layer_idx],
+                                                                       'IFM': all_inputs[layer_idx],
+                                                                       'stride': (1,1)
+                                                        })
+                                                with open(os.path.join("mlp.h5"), "wb") as f:
+                                                        pickle.dump(models, f)
+                                                #print([ifm.shape for ifm in all_inputs])
+                                                #print([filt.shape for filt in all_filts])
+                                                exit(0)
+                                        else:
+                                                _, loss_val = sess.run([train_op, loss], feed_dict={ batch_size_tensor: batch_size })
+                                        old_time = timer
+                                        timer = time.perf_counter()
+                                        elapsed_time = timer - old_time
+                                        throughput = PRINT_INTERVAL * batch_size / elapsed_time
+                                        throughputs.append(throughput)
+                                        print(f"Iteration#{i}: loss={loss_val} time={int(elapsed_time*1000000)}[µs] thp={throughput}/s")
+                                else:
+                                        sess.run([train_op], feed_dict={ batch_size_tensor: batch_size })
+                                        
+                        img = np.reshape(sess.run(output_tensor, feed_dict={ input_tensor: xy, batch_size_tensor: xy.shape[0] }), img_shape)
+                        filename = f"{batch_size}-after-{N_ITERS}-iters-tensorflow.jpg"
+                        print(f"Saving {filename}")
+                        write_image(filename, img)
 
-	# Initialize non-TF stuff
-	with open(os.path.join(DATA_DIR, args.config)) as config_file:
-		config = json.load(config_file)
-
-	target_fun = Image(os.path.join(IMAGES_DIR, args.image))
-	encoding = OneBlob(config["encoding"]["n_bins"], 1)
-
-	# Initialize TF graph
-	batch_size_tensor = tf.placeholder(tf.int32, shape=[])
-	optimizer = tf.train.AdamOptimizer(config["optimizer"]["learning_rate"], config["optimizer"]["beta1"], config["optimizer"]["beta2"], config["optimizer"]["epsilon"])
-	train_op, loss, input_tensor, output_tensor = make_graph()
-
-	# Variables for saving/displaying image results
-	resolution = 1024
-	img_shape = (resolution, resolution, target_fun.n_channels)
-
-	half_dx = 0.5 / resolution
-	xs = np.linspace(half_dx, 1-half_dx, resolution)
-	xv, yv = np.meshgrid(xs, xs)
-
-	xy = np.stack((xv.flatten(), yv.flatten())).transpose()
-	gt = np.reshape(target_fun(xy), img_shape)
-	write_image("reference.jpg", gt)
-
-	# Enable XLA compiler (important for good TensorFlow performance)
-	session_config = tf.ConfigProto()
-	session_config.graph_options.optimizer_options.global_jit_level = tf.OptimizerOptions.ON_1
-
-	timer = time.perf_counter()
-
-	# Run the network
-	with tf.Session(config=session_config) as sess:
-		PRINT_INTERVAL = 100
-
-		bench_result = { "tensorflow": [] }
-
-		for batch_size in [2**14, 2**15, 2**16, 2**17, 2**18, 2**19, 2**20, 2**21]:
-			N_ITERS = 1000
-			PRINT_INTERVAL = 100
-
-			output_dummy_variable = tf.Variable(tf.zeros(shape=[batch_size, target_fun.n_channels], dtype=tf.float32), trainable=False)
-			sess.run(tf.initialize_all_variables())
-
-			# Training
-			c = lambda it, _, __: tf.less(it, PRINT_INTERVAL)
-			def body(it, sequencer, _):
-				with tf.control_dependencies([sequencer]):
-					local_train_op, local_loss, _, _ = make_graph()
-				with tf.control_dependencies([local_train_op]):
-					next_sequencer = tf.ones([])
-					return it+1, next_sequencer, local_loss
-
-			train_op, _, loss = tf.while_loop(c, body, [0, 1., 0.], parallel_iterations=1)
-
-			throughputs = []
-			for i in range(0, N_ITERS, PRINT_INTERVAL):
-				if i % PRINT_INTERVAL == 0:
-					_, loss_val = sess.run([train_op, loss], feed_dict={ batch_size_tensor: batch_size })
-					old_time = timer
-					timer = time.perf_counter()
-					elapsed_time = timer - old_time
-					throughput = PRINT_INTERVAL * batch_size / elapsed_time
-					throughputs.append(throughput)
-					print(f"Iteration#{i}: loss={loss_val} time={int(elapsed_time*1000000)}[µs] thp={throughput}/s")
-				else:
-					sess.run([train_op], feed_dict={ batch_size_tensor: batch_size })
-
-
-			img = np.reshape(sess.run(output_tensor, feed_dict={ input_tensor: xy, batch_size_tensor: xy.shape[0] }), img_shape)
-			filename = f"{batch_size}-after-{N_ITERS}-iters-tensorflow.jpg"
-			print(f"Saving {filename}")
-			write_image(filename, img)
-
-			mean_training_throughput = np.mean(throughputs[1:])
-
-			print(f"Finished training benchmark. Mean throughput is {mean_training_throughput}/s. Waiting 10s for GPU to cool down.")
-			time.sleep(10)
-
-			# Inference
-			_, _, _, tmp_out = make_graph()
-			inference_op = output_dummy_variable.assign(tmp_out)
-
-			N_ITERS *= 2
-			PRINT_INTERVAL *= 2
-
-			throughputs = []
-			for i in range(N_ITERS):
-				sess.run(inference_op, feed_dict={ batch_size_tensor: batch_size })
-				if i % PRINT_INTERVAL == 0:
-					old_time = timer
-					timer = time.perf_counter()
-					elapsed_time = timer - old_time
-					throughput = PRINT_INTERVAL * batch_size / elapsed_time
-					throughputs.append(throughput)
-					print(f"Iteration#{i}: time={int(elapsed_time*1000000)}[µs] thp={throughput}/s")
-
-			mean_inference_throughput = np.mean(throughputs[1:])
-
-			print(f"Finished inference benchmark. Mean throughput is {mean_inference_throughput}/s. Waiting 10s for GPU to cool down.")
-			time.sleep(10)
-
-			# Mean throughput (discounting the first one due to XLA compilation)
-			bench_result["tensorflow"].append(
-				{
-					"batch_size" : batch_size,
-					"training_throughput" : mean_training_throughput,
-					"inference_throughput" : mean_inference_throughput,
-				}
-			)
-
-		with open("bench_result_tensorflow.json", "w") as f:
-			json.dump(bench_result, f)
+                        mean_training_throughput = np.mean(throughputs[1:])
+                        
+                        print(f"Finished training benchmark. Mean throughput is {mean_training_throughput}/s. Waiting 10s for GPU to cool down.")
+                        time.sleep(10)
+                        
+                        # Inference
+                        _, _, _, tmp_out, ifms, filts = make_graph()
+                        inference_op = output_dummy_variable.assign(tmp_out)
+                        
+                        N_ITERS *= 2
+                        PRINT_INTERVAL *= 2
+                        
+                        throughputs = []
+                        for i in range(N_ITERS):
+                                sess.run(inference_op, feed_dict={ batch_size_tensor: batch_size })
+                                if i % PRINT_INTERVAL == 0:
+                                        old_time = timer
+                                        timer = time.perf_counter()
+                                        elapsed_time = timer - old_time
+                                        throughput = PRINT_INTERVAL * batch_size / elapsed_time
+                                        throughputs.append(throughput)
+                                        print(f"Iteration#{i}: time={int(elapsed_time*1000000)}[µs] thp={throughput}/s")
+                                        
+                        mean_inference_throughput = np.mean(throughputs[1:])
+                        
+                        print(f"Finished inference benchmark. Mean throughput is {mean_inference_throughput}/s. Waiting 10s for GPU to cool down.")
+                        time.sleep(10)
+                        
+                        # Mean throughput (discounting the first one due to XLA compilation)
+                        bench_result["tensorflow"].append(
+                                {
+                                        "batch_size" : batch_size,
+                                        "training_throughput" : mean_training_throughput,
+                                        "inference_throughput" : mean_inference_throughput,
+                                }
+                        )
+                        
+                with open("bench_result_tensorflow.json", "w") as f:
+                        json.dump(bench_result, f)
